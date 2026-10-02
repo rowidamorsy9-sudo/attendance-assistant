@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Attendance</title>
+<style>
+:root{--bg:#f3f5f7;--ink:#14212b;--mute:#5d6b76;--line:#d3dae0;--card:#fff;--accent:#0b6e5c;--accent-ink:#fff;--warn:#a3341f;--ok:#0b6e5c}
+@media(prefers-color-scheme:dark){:root{--bg:#0f171d;--ink:#e8eef2;--mute:#92a1ad;--line:#26343e;--card:#16222a;--accent:#3cc4a6;--accent-ink:#062820;--warn:#ff9a85;--ok:#3cc4a6}}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;min-height:100vh;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom)}
+main{max-width:440px;margin:0 auto;padding:24px 0}
+h1{font-size:1.5rem;margin:0 0 4px}
+p.sub{margin:0 0 20px;color:var(--mute)}
+button{font:inherit;cursor:pointer;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--ink);padding:14px 16px;width:100%;text-align:left}
+button:focus-visible,input:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600;text-align:center}
+button:disabled{opacity:.45;cursor:not-allowed}
+.stack{display:grid;gap:10px}
+.row{display:flex;gap:8px}
+.row button{width:auto}
+input[type=text]{flex:1;min-width:0;font:inherit;padding:12px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
+#scanner{display:none;position:relative;border-radius:14px;overflow:hidden;background:#000;aspect-ratio:3/4;margin-bottom:12px}
+#scanner video{width:100%;height:100%;object-fit:cover}
+#frame{position:absolute;inset:18% 14%;border:3px solid rgba(255,255,255,.85);border-radius:14px;pointer-events:none;box-shadow:0 0 0 999px rgba(0,0,0,.35)}
+#stop{position:absolute;right:10px;top:10px;width:auto;padding:8px 12px}
+#msg{min-height:1.4em;margin:14px 0 6px;font-weight:500}
+#msg.err{color:var(--warn)} #msg.ok{color:var(--ok)}
+#urlbox{display:none;word-break:break-all;font:13px ui-monospace,Menlo,monospace;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px;margin-bottom:10px}
+label.auto{display:flex;gap:8px;align-items:center;color:var(--mute);margin-top:14px;font-size:.9rem}
+canvas{display:none}
+</style>
+</head>
+<body>
+<main>
+  <h1>Attendance</h1>
+  <p class="sub">Scan the QR code on the lecture screen.</p>
+
+  <div id="scanner" aria-live="polite">
+    <video id="video" playsinline muted></video>
+    <div id="frame"></div>
+    <button id="stop" type="button">Cancel</button>
+  </div>
+
+  <div class="stack">
+    <button id="scanBtn" type="button">📷 SCAN QR</button>
+    <button id="uploadBtn" type="button">📁 UPLOAD QR IMAGE</button>
+    <input id="file" type="file" accept="image/*" hidden>
+    <div class="row">
+      <input id="paste" type="text" inputmode="url" placeholder="Paste QR URL" aria-label="QR URL">
+      <button id="pasteBtn" type="button">PASTE QR URL</button>
+    </div>
+  </div>
+
+  <div id="msg" role="status"></div>
+  <div id="urlbox"></div>
+  <button id="go" class="primary" type="button" disabled>TAKE ATTENDANCE</button>
+
+  <label class="auto"><input id="auto" type="checkbox" checked> Take attendance as soon as a QR is detected</label>
+</main>
+
+<canvas id="cv"></canvas>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+<script>
+// ---- Configuration -------------------------------------------------------
+// Restrict to your university's attendance host(s), e.g. ['msa.edu.eg'].
+// Empty array = any https URL is accepted.
+const ALLOWED_HOSTS = [];
+
+// Hook: called with the validated attendance URL. Replace the body with your
+// automation (e.g. fetch('/api/attendance', {method:'POST', body: url}) to your
+// own backend). The default simply opens the URL.
+function startAttendance(url) {
+  window.location.assign(url);
+}
+
+// ---- Helpers -------------------------------------------------------------
+const $ = id => document.getElementById(id);
+const video = $('video'), cv = $('cv'), ctx = cv.getContext('2d', {willReadFrequently:true});
+const detector = ('BarcodeDetector' in window) ? new BarcodeDetector({formats:['qr_code']}) : null;
+let stream = null, scanning = false, currentUrl = null, lastBad = 0;
+
+function say(text, kind='') { const m = $('msg'); m.textContent = text; m.className = kind; }
+
+function validate(raw) {
+  try {
+    const u = new URL(String(raw).trim());
+    if (u.protocol !== 'https:') return null;
+    if (ALLOWED_HOSTS.length && !ALLOWED_HOSTS.some(h => u.hostname === h || u.hostname.endsWith('.' + h))) return null;
+    return u.href;
+  } catch { return null; }
+}
+
+function accept(raw, source) {
+  const url = validate(raw);
+  if (!url) { say('That is not a valid attendance QR.', 'err'); return false; }
+  currentUrl = url;
+  $('urlbox').style.display = 'block'; $('urlbox').textContent = url;
+  $('go').disabled = false;
+  say('QR detected ✓', 'ok');
+  if ($('auto').checked) startAttendance(url);
+  return true;
+}
+
+// ---- Decoding ------------------------------------------------------------
+function jsqrDecode(source, w, h, both) {
+  if (!window.jsQR) return null;
+  const scale = Math.min(1, 800 / Math.max(w, h));
+  cv.width = Math.round(w * scale); cv.height = Math.round(h * scale);
+  ctx.drawImage(source, 0, 0, cv.width, cv.height);
+  const img = ctx.getImageData(0, 0, cv.width, cv.height);
+  const r = jsQR(img.data, img.width, img.height, {inversionAttempts: both ? 'attemptBoth' : 'dontInvert'});
+  return r ? r.data : null;
+}
+
+async function decode(source, w, h, both) {
+  if (detector) {
+    try { const c = await detector.detect(source); if (c.length) return c[0].rawValue; } catch {}
+  }
+  return jsqrDecode(source, w, h, both);
+}
+
+// ---- Camera scanner ------------------------------------------------------
+async function startScan() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    say('Camera is not available here. Open this page over HTTPS, or use Paste QR URL.', 'err'); return;
+  }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {facingMode: {ideal: 'environment'}, width: {ideal: 1280}, height: {ideal: 720}}, audio: false
+    });
+  } catch (e) {
+    const denied = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError');
+    say(denied
+      ? 'Camera access is required for QR scanning. Allow it in your browser settings, or use Paste QR URL.'
+      : 'Could not open the camera. Use Paste QR URL instead.', 'err');
+    return;
+  }
+  video.srcObject = stream;
+  await video.play();
+  $('scanner').style.display = 'block';
+  say('Point the camera at the QR code.');
+  scanning = true;
+  requestAnimationFrame(tick);
+}
+
+function stopScan() {
+  scanning = false;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; video.srcObject = null;
+  $('scanner').style.display = 'none';
+}
+
+async function tick() {
+  if (!scanning) return;
+  if (video.readyState >= 2 && video.videoWidth) {
+    const raw = await decode(video, video.videoWidth, video.videoHeight, false);
+    if (raw && scanning) {
+      if (validate(raw)) { stopScan(); accept(raw, 'camera'); return; }
+      if (Date.now() - lastBad > 1500) { lastBad = Date.now(); say('Not an attendance QR. Keep scanning.', 'err'); }
+    }
+  }
+  requestAnimationFrame(tick);
+}
+
+// ---- Image upload --------------------------------------------------------
+async function decodeFile(file) {
+  say('Reading image…');
+  try {
+    const bmp = await createImageBitmap(file);
+    const raw = await decode(bmp, bmp.width, bmp.height, true);
+    if (!raw) { say('No QR code found in that image.', 'err'); return; }
+    accept(raw, 'image');
+  } catch { say('Could not read that image.', 'err'); }
+}
+
+// ---- Wiring --------------------------------------------------------------
+$('scanBtn').onclick = startScan;
+$('stop').onclick = () => { stopScan(); say(''); };
+$('uploadBtn').onclick = () => $('file').click();
+$('file').onchange = e => { const f = e.target.files[0]; if (f) decodeFile(f); e.target.value = ''; };
+$('pasteBtn').onclick = async () => {
+  let text = $('paste').value;
+  if (!text && navigator.clipboard && navigator.clipboard.readText) {
+    try { text = await navigator.clipboard.readText(); $('paste').value = text; } catch {}
+  }
+  if (!text) { say('Paste the QR URL into the box first.', 'err'); return; }
+  accept(text, 'paste');
+};
+$('paste').addEventListener('keydown', e => { if (e.key === 'Enter') $('pasteBtn').click(); });
+$('go').onclick = () => { if (currentUrl) startAttendance(currentUrl); };
+document.addEventListener('visibilitychange', () => { if (document.hidden && scanning) stopScan(); });
+</script>
+</body>
+</html>
